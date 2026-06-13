@@ -21,16 +21,16 @@ const BROWSER_PROCESS_NAME   = 'brave';                                         
 
 const GIT_BASH_WINDOW_X      = -6;                                                // GitBash ウィンドウを画面左上に置く (`0` だと隙間ができてしまうため)
 const GIT_BASH_WINDOW_Y      = -1;                                                // GitBash ウィンドウの位置
-const GIT_BASH_WINDOW_WIDTH  = 555;                                               // GitBash ウィンドウの幅・テキストが適度な長さになるように
+const GIT_BASH_WINDOW_WIDTH  = 545;                                               // GitBash ウィンドウの幅・テキストが適度な長さになるように
 const GIT_BASH_WINDOW_HEIGHT = 608;                                               // GitBash ウィンドウの高さ
 const VLC_WINDOW_X           = GIT_BASH_WINDOW_WIDTH + (GIT_BASH_WINDOW_X) - 14;  // VLC ウィンドウを GitBash ウィンドウとブラウザウィンドウの右側に置く
 const VLC_WINDOW_Y           = 0;                                                 // VLC ウィンドウの位置
 const VLC_WINDOW_WIDTH       = 2200 - VLC_WINDOW_X;                               // VLC ウィンドウの幅
-const VLC_WINDOW_HEIGHT      = 1211;                                              // Y = 0 の場合にタスクバーにかからない高さ
+const VLC_WINDOW_HEIGHT      = 1192;                                              // Y = 0 の場合にタスクバーにかからない高さ
 const BROWSER_WINDOW_X       = -6;                                                // ブラウザウィンドウを画面左下に置く (`0` だと隙間ができてしまうため)
 const BROWSER_WINDOW_Y       = 600;                                               // ブラウザウィンドウの位置
-const BROWSER_WINDOW_WIDTH   = 555;                                               // ブラウザウィンドウの幅
-const BROWSER_WINDOW_HEIGHT  = 611;                                               // ブラウザウィンドウの高さ
+const BROWSER_WINDOW_WIDTH   = 545;                                               // ブラウザウィンドウの幅
+const BROWSER_WINDOW_HEIGHT  = 592;                                               // ブラウザウィンドウの高さ
 
 const SKIP_THRESHOLD         = 0.8;                                               // 再生位置が 80% 未満ならスキップとみなす
 const PORT                   = 3000;                                              // HTTP サーバのポート
@@ -42,6 +42,20 @@ const PORT                   = 3000;                                            
 // キー操作とフロントエンド操作で処理できるようにグローバルに持たせる
 let currentEntry  = null;
 let currentClient = null;
+
+const playedInSession = [];  // セッション中に再生済みのファイルを記録する
+let isGoingBack = false;  // 「戻る」操作中か否か
+
+process.on('unhandledRejection', async (error, promise) => {
+  console.error('Unhandled Rejection', error, promise);
+  await new Promise(resolve => setTimeout(resolve, 3000));
+});
+
+process.on('uncaughtException', async error => {
+  console.error('Uncaught Exception', error);
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  process.abort();
+});
 
 /** CSV ファイルを読み込んで連想配列として返す */
 function loadStats() {
@@ -268,6 +282,13 @@ function setupKeyControls() {
       console.log('[CLI] Skipping...');
       gracefulQuit();
     }
+    // `p` で1つ前のファイルに戻る
+    if(key === 'p') {
+      if(playedInSession.length <= 1) return console.log('[CLI] No Previous Video');
+      console.log('[CLI] Going Back...');
+      isGoingBack = true;
+      gracefulQuit();
+    }
     // `b` でブラウザウィンドウを開けるようにしておく
     if(key === 'b') {
       console.log('[CLI] Open Browser Window');
@@ -295,14 +316,25 @@ async function playVideo(entry, stats) {
   await new Promise(resolve => setTimeout(resolve, 750));
   
   const client = new net.Socket();
-  let position = 0;
+  let pollTimer = null;
+  let position     = 0;  // 再生位置の記録
+  let prevPosition = 0;  // 「次を再生」ボタンの押下検知用
   client.connect(RC_PORT, '127.0.0.1', () => {
     client.write('get_time\n');
+    pollTimer = setInterval(() => {
+      if(!client.destroyed) client.write('get_time\n');
+    }, 300);
   });
   client.on('data', data => {
     const text = data.toString().trim();
     const num = Number.parseInt(text);
-    if(!Number.isNaN(num)) position = num;
+    if(!Number.isNaN(num)) {
+      // 「次を再生」ボタン押下の検知 : 5秒以上再生していた状態から突然1秒以下に戻ったら「次を再生」ボタン押下と判定する
+      if(prevPosition > 1 && num <= 1 && !client.destroyed) gracefulQuit();
+      
+      prevPosition = position;
+      position = num;
+    }
   });
   
   arrangeVlcWindow();  // VLC ウィンドウの位置を調整する
@@ -313,6 +345,7 @@ async function playVideo(entry, stats) {
   
   return new Promise(resolve => {
     vlc.on('exit', () => {
+      if(pollTimer != null) clearInterval(pollTimer);  // タイマーを止める
       client.destroy();
       entry.playCount++;
       entry.lastPlayedAt = new Date().toISOString();
@@ -329,9 +362,25 @@ async function mainLoop() {
   let stats = loadStats();
   stats = syncFiles(stats);
   saveStats(stats);
-  // 動画ファイルを1つ抽出する (`entry` は `stats` 内のオブジェクトの参照のため `playVideo` 内で `entry` を更新すれば `saveStats()` で問題なく更新可能)
+  
   const statsList = Object.values(stats);
-  const entry = weightedPick(statsList);
+  
+  // 「戻る」操作中なら履歴から取り出す
+  let entry;
+  if(isGoingBack) {
+    isGoingBack = false;
+    const prevFileName = playedInSession.pop();  // 現在再生中を取り除く
+    const targetFileName = playedInSession.pop();  // 1つ前を取り出す
+    entry = stats[targetFileName] ?? weightedPick(statsList);  // 見つからなければランダムに抽出する
+  }
+  else {
+    const unplayed = statsList.filter(stat => !playedInSession.includes(stat.fileName));
+    if(unplayed.length === 0) playedInSession.length = 0;
+    const candidates = playedInSession.length === 0 ? statsList : unplayed;
+    entry = weightedPick(candidates);
+  }
+  playedInSession.push(entry.fileName);
+  
   // 再生する
   await playVideo(entry, stats);
   // 再度ループする
@@ -346,7 +395,7 @@ async function mainLoop() {
   }
   
   console.log('Random Play : Ctrl+C Is Unavailable');
-  console.log('[q] Exit [d] Delete [s] Skip [b] Browser');
+  console.log('[q]Exit [d]Delete [s]Skip [p]Prev [b]Browser');
   
   // Web サーバを立てる
   http.createServer(async (req, res) => {
@@ -362,7 +411,7 @@ async function mainLoop() {
             <title>Random Play</title>
             <style>
               html { font-family: sans-serif; font-weight: bold; }
-              button { display: block; width: 100%; padding-block: 1rem; font-weight: bold; cursor: pointer; }
+              button { display: block; width: 100%; padding-block: 1.5rem; font-weight: bold; cursor: pointer; }
             </style>
           </head>
           <body>
@@ -370,6 +419,7 @@ async function mainLoop() {
             <p><button onclick="fetch('/q')" accesskey="q">Quit</button></p>
             <p><button onclick="fetch('/s')" accesskey="s">Skip</button></p>
             <p><button onclick="fetch('/d')" accesskey="d">Delete</button></p>
+            <p><button onclick="fetch('/p')" accesskey="p">Previous</button></p>
             <p><button onclick="fetch('/a')" accesskey="aq">Arrange</button></p>
           </body>
         </html>
@@ -402,6 +452,16 @@ async function mainLoop() {
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Skipping OK');
       
+      gracefulQuit();
+      return;
+    }
+    if(path === '/p') {
+      console.log('[Server] Going Back...');
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Prev OK');
+      
+      if(playedInSession.length <= 1) return;
+      isGoingBack = true;
       gracefulQuit();
       return;
     }
@@ -441,6 +501,11 @@ async function mainLoop() {
       }
     `
   ]).unref();
+  
+  // ブラウザウィンドウを開いて調整する
+  childProcess.spawn('powershell', ['-Command', `Start-Process "${BROWSER_PROCESS_NAME}.exe" "http://localhost:${PORT}/"`]).unref();
+  await new Promise(resolve => setTimeout(resolve, 500));
+  arrangeBrowserWindow();
   
   // メインループを実行する
   mainLoop();
