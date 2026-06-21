@@ -48,11 +48,13 @@ let isGoingBack = false;  // 「戻る」操作中か否か
 
 process.on('unhandledRejection', async (error, promise) => {
   console.error('Unhandled Rejection', error, promise);
+  fs.writeFileSync('unhandled.txt', new Date().toISOString() + '\n' + error.toString(), 'utf-8');
   await new Promise(resolve => setTimeout(resolve, 3000));
 });
 
 process.on('uncaughtException', async error => {
   console.error('Uncaught Exception', error);
+  fs.writeFileSync('uncaught.txt', new Date().toISOString() + '\n' + error.toString(), 'utf-8');
   await new Promise(resolve => setTimeout(resolve, 3000));
   process.abort();
 });
@@ -249,7 +251,12 @@ function arrangeBrowserWindow() {
 
 /** VLC RC に終了するコマンドを投げる */
 function gracefulQuit() {
-  if(currentClient != null && !currentClient.destroyed) currentClient.write('quit\n');
+  //console.log(`[${new Date().toISOString()}] gracefulQuit Called`, { clientIsNull: currentClient == null, clientDestroyed: currentClient?.destroyed });
+  if(currentClient != null && !currentClient.destroyed) {
+    currentClient.write('quit\n', error => {
+      if(error != null) console.error(`[${new Date().toISOString()}] gracefulQuit Write Error`, error);
+    });
+  }
 }
 
 /** 動画ファイル再生中にキー入力を受け付けるようにする */
@@ -314,6 +321,8 @@ async function playVideo(entry, stats) {
     fullPath,
   ]);
   await new Promise(resolve => setTimeout(resolve, 750));
+  //vlc.on('error', error => console.error(`[${new Date().toISOString()}] vlc Process Error`, error));
+  //vlc.stderr.on('data', data => console.error(`[${new Date().toISOString()}] vlc stderr`, data.toString()));
   
   const client = new net.Socket();
   let pollTimer = null;
@@ -322,7 +331,7 @@ async function playVideo(entry, stats) {
   client.connect(RC_PORT, '127.0.0.1', () => {
     client.write('get_time\n');
     pollTimer = setInterval(() => {
-      if(!client.destroyed) client.write('get_time\n');
+      if(client != null && !client.destroyed) client.write('get_time\n');
     }, 300);
   });
   client.on('data', data => {
@@ -336,6 +345,12 @@ async function playVideo(entry, stats) {
       position = num;
     }
   });
+  //client.on('close', hadError => { console.log(`[${new Date().toISOString()}] client Close`, hadError); });
+  // ECONNRESET 発生時のための処理
+  client.on('error', error => {
+    console.error(`[${new Date().toISOString()}] client Error`, error);
+    client.destroy();
+  });
   
   arrangeVlcWindow();  // VLC ウィンドウの位置を調整する
   currentEntry  = entry;
@@ -345,6 +360,7 @@ async function playVideo(entry, stats) {
   
   return new Promise(resolve => {
     vlc.on('exit', () => {
+      //console.log(`[${new Date().toISOString()}] vlc On Exit`);
       if(pollTimer != null) clearInterval(pollTimer);  // タイマーを止める
       client.destroy();
       entry.playCount++;
